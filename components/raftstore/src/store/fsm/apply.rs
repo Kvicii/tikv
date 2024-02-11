@@ -551,6 +551,7 @@ where
     fn commit_opt(&mut self, delegate: &mut ApplyDelegate<EK>, persistent: bool) {
         delegate.update_metrics(self);
         if persistent {
+            // 写入 RocksDB
             if let (_, Some(seqno)) = self.write_to_db() {
                 delegate.unfinished_write_seqno.push(seqno);
             }
@@ -590,6 +591,7 @@ where
                 let sn = SequenceNumber::pre_write();
                 seqno = Some(sn);
             }
+            // 将该 WriteBatch 提交到底层引擎
             let seq = self.kv_wb_mut().write_opt(&write_opts).unwrap_or_else(|e| {
                 panic!("failed to write to engine: {:?}", e);
             });
@@ -641,6 +643,7 @@ where
             for tracker in cb.write_trackers() {
                 tracker.observe(now, &self.apply_time, |t| &mut t.metrics.apply_time_nanos);
             }
+            // 执行 callback 尽快返回客户端
             cb.invoke_with_response(resp);
         }
         self.apply_time.flush();
@@ -725,6 +728,7 @@ where
         if !self.apply_res.is_empty() {
             fail_point!("before_nofity_apply_res");
             let apply_res = mem::take(&mut self.apply_res);
+            // 将 ApplyRes 重新发送到 RaftBatchSystem 中去, 进而更新某些内存结构
             self.notifier.notify(apply_res);
         }
 
@@ -1128,6 +1132,7 @@ where
             // running on data written by new version tikv), but PD will reject old version
             // tikv join the cluster, so this should not happen.
             let res = match entry.get_entry_type() {
+                // handle_raft_entry_normal 处理
                 EntryType::EntryNormal => self.handle_raft_entry_normal(apply_ctx, &entry),
                 EntryType::EntryConfChange | EntryType::EntryConfChangeV2 => {
                     self.handle_raft_entry_conf_change(apply_ctx, &entry)
@@ -1254,6 +1259,8 @@ where
                     return ApplyResult::Yield;
                 }
 
+                // 尝试将调用 ApplyDelegate::process_raft_cmd 函数来将本次写入缓存到 kv_write_batch 中
+                // 在写入缓存之前会首先判断是否能够进行一次提交， 如果可以则需要在写入缓存之前将这一批日志提交到底层引擎
                 return self.process_raft_cmd(apply_ctx, index, term, cmd);
             }
         } else {
@@ -4020,6 +4027,7 @@ where
         // low-priority.
         self.delegate.priority = Priority::Normal;
         self.delegate
+            // handle_raft_committed_entries 处理
             .handle_raft_committed_entries(apply_ctx, entries.drain(..));
         fail_point!("post_handle_apply_1003", self.delegate.id() == 1003, |_| {});
     }
@@ -4359,6 +4367,7 @@ where
                 match &msg {
                     Msg::Apply { .. } => (),
                     _ => {
+                        // handle_apply 处理
                         self.handle_apply(apply_ctx, batch_apply.take().unwrap());
                         if let Some(ref mut state) = self.delegate.yield_state {
                             state.pending_msgs.push(msg);
@@ -4616,6 +4625,7 @@ where
             normal.delegate.id() == 1003,
             |_| { HandleResult::KeepProcessing }
         );
+        // 首先尝试获取 messages_per_tick 次路由到该状态机的消息
         while self.msg_buf.len() < self.messages_per_tick {
             match normal.receiver.try_recv() {
                 Ok(msg) => self.msg_buf.push(msg),
@@ -4631,6 +4641,7 @@ where
             }
         }
 
+        // 调用 ApplyFSM::handle_tasks 函数进行处理
         normal.handle_tasks(&mut self.apply_ctx, &mut self.msg_buf);
 
         if normal.delegate.wait_merge_state.is_some() {

@@ -135,6 +135,7 @@ fn run_impl<CER: ConfiguredRaftEngine, F: KvFormat>(
     service_event_tx: TikvMpsc::Sender<ServiceEvent>,
     service_event_rx: TikvMpsc::Receiver<ServiceEvent>,
 ) {
+    // 做若干重要结构的初始化, 包含但不限于 batch_system, concurrency_manager, background_worker, quota_limiter 等等
     let mut tikv = TikvServer::<CER, F>::init(config, service_event_tx.clone());
     // Must be called after `TikvServer::init`.
     let memory_limit = tikv.core.config.memory_usage_limit.unwrap().0;
@@ -149,10 +150,19 @@ fn run_impl<CER: ConfiguredRaftEngine, F: KvFormat>(
     let listener = tikv.core.init_flow_receiver();
     let (engines, engines_info) = tikv.init_raw_engines(listener);
     tikv.init_engines(engines.clone());
+    // 将 RPC handler 与 KVService 绑定起来
     let server_config = tikv.init_servers();
     tikv.register_services();
     tikv.init_metrics_flusher(fetcher, engines_info);
     tikv.init_storage_stats_task(engines);
+    // grpc server 绑定对应的端口并开始监听连接
+    // KVService 服务启动后, 所有发往监听端口的请求便会路由到 KVService 对应的 handler 上
+    // 当 KVService 收到请求之后, 会根据请求的类型把这些请求转发到不同的模块进行处理:
+        // 对于从 TiDB 下推的读请求, 比如 sum, avg 操作, 会转发到 Coprocessor 模块进行处理;
+        // 对于 KV 请求会直接转发到 Storage 模块进行处理;
+    // KV 操作根据功能可以被划分为 Raw KV 操作以及 Txn KV 操作两大类:
+        // Raw KV 操作包括 raw put, raw get, raw delete, raw batch get, raw batch put, raw batch delete, raw scan 等普通 KV 操作
+        // Txn KV 操作是为了实现事务机制而设计的一系列操作, 如 prewrite 和 commit 分别对应于 2PC 中的 prepare 和 commit 阶段的操作
     tikv.run_server(server_config);
     tikv.run_status_server();
     tikv.core.init_quota_tuning_task(tikv.quota_limiter.clone());

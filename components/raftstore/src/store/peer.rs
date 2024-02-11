@@ -2440,6 +2440,11 @@ where
         }
     }
 
+    /// 在三副本情况下, 该 PreWrite 请求会存在于本次 ready 需要持久化的日志和需要发往其他两个 peer 的 message 中
+    /// 对于 message, 一旦收到就会 spawn 给 Transport 让其异步发送
+    /// 对于持久化, 在不开启 async-io 的情况下, 数据会被暂存到内存中在当前 loop 结尾的 end 函数中实际写入到底层引擎中去
+    /// 等到任何一个 follower 返回确认后, 该 response 会被路由到 RaftBatchSystem, PollHandler 在接下来的一次 loop 中对其进行处理, 该请求会被路由到 PeerFsmDelegate::handle_msgs 函数的 PeerMsg::RaftMessage(msg) 分支中, 进而调用 step 函数交给 raft-rs 状态机进行处理
+    /// 在已经满足了 quorum 的写入时, raft-rs 会将该 PreWrite 请求对应的 raftlog 进行提交并在下一次被获取 ready 时返回, 在本轮 loop 的 PeerFsmDelegate::collect_ready() 函数及 Peer::handle_raft_ready_append 函数中, 会调用 self.handle_raft_committed_entries(ctx, ready.take_committed_entries()) 函数; 在该函数中, 其会根据已提交日志从 Peer 的 proposals 中获取到对应的 callback, 连带这一批所有的已提交日志构建一个 Apply Task 通过 apply_router 发送给 ApplyBatchSystem
     pub fn handle_raft_ready_append<T: Transport>(
         &mut self,
         ctx: &mut PollContext<EK, ER, T>,
@@ -3340,6 +3345,7 @@ where
             panic!("{} should not applying snapshot.", self.tag);
         }
 
+        // ApplyRes 中携带的信息会被用来更新一些内存状态例如 raft_group 和 cmd_epoch_checker
         let applied_index = apply_state.get_applied_index();
         self.raft_group.advance_apply_to(applied_index);
 
@@ -3368,9 +3374,12 @@ where
             has_ready = true;
         }
         if !self.is_leader() {
+            // 通过 store::peer::post_pending_read_index_on_replica 释放某些满足条件的 ReadIndexRequest
             self.post_pending_read_index_on_replica(ctx)
         } else if self.ready_to_handle_read() {
             while let Some(mut read) = self.pending_reads.pop_front() {
+                // 通过 self.pending_reads.pop_front() 释放某些满足条件的 ReadIndexRequest
+                // 对于每个 ReadIndexRequest, 此时可以通过 store::peer::response_read 函数来获取底层引擎的 Snapshot 并执行 callback 返回
                 self.response_read(&mut read, ctx, false);
             }
         }
@@ -3508,12 +3517,15 @@ where
         };
         let is_urgent = is_request_urgent(&req);
 
+        // 再进行一次 inspect
         let policy = self.inspect(&req);
         let res = match policy {
+            // 如果此时 Leader 的 lease 已经稳定, 则会调用 read_local 函数直接获取引擎的 snapshot 并执行 callback 返回
             Ok(RequestPolicy::ReadLocal) | Ok(RequestPolicy::StaleRead) => {
                 self.read_local(ctx, req, cb);
                 return false;
             }
+            // 否则调用 read_index 函数执行 ReadIndex 流程
             Ok(RequestPolicy::ReadIndex) => return self.read_index(ctx, req, err_resp, cb),
             Ok(RequestPolicy::ProposeTransferLeader) => {
                 return self.propose_transfer_leader(ctx, req, cb);
@@ -3523,6 +3535,7 @@ where
                 if req.has_admin_request() {
                     disk_full_opt = DiskFullOpt::AllowedOnAlmostFull;
                 }
+                // propose_normal 处理 ReadIndex, PreWrite 请求
                 self.check_normal_proposal_with_disk_full_opt(ctx, disk_full_opt)
                     .and_then(|_| self.propose_normal(ctx, req))
             }
@@ -3818,6 +3831,8 @@ where
                 if let Some(read) = self.pending_reads.back_mut() {
                     // A read request proposed in the current lease is found; combine the new
                     // read request to that previous one, so that no proposing needed.
+                    // ReadIndex 请求连带 callback 会被构建成一个 ReadIndexRequest 被 push 到 pending_reads 即一个 ReadIndexQueue 中
+                    // 之后当前线程即可结束本轮流程, 之后的事件会进而触发该 ReadIndexRequest 的执行
                     read.push_command(req, cb, commit_index);
                     return false;
                 }
@@ -4336,6 +4351,8 @@ where
 
         fail_point!("raft_propose", |_| Ok(Either::Right(0)));
         let propose_index = self.next_proposal_index();
+        // propose 到 raft-rs 的 RawNode 接口中
+        // 同时其 callback 会连带该请求的 logIndex 被 push 到该 Peer 的 proposals 中去
         self.raft_group.propose(ctx.to_vec(), data)?;
         if self.next_proposal_index() == propose_index {
             // The message is dropped silently, this usually due to leader absence
@@ -5552,17 +5569,21 @@ pub trait RequestInspector {
             return Ok(RequestPolicy::StaleRead);
         }
 
+        // 如果该请求明确要求需要用 read index 方式处理, 所以返回 ReadIndex
         if req.get_header().get_read_quorum() {
             return Ok(RequestPolicy::ReadIndex);
         }
 
         // If applied index's term differs from current raft's term, leader
         // transfer must happened, if read locally, we may read old value.
+        // 如果该 leader 尚未 apply 到它自己的 term, 则使用 ReadIndex 处理, 这是 Raft 有关线性一致性读的一个 corner case
         if !self.has_applied_to_current_term() {
             return Ok(RequestPolicy::ReadIndex);
         }
 
         // Local read should be performed, if and only if leader is in lease.
+        // 如果该 leader 的 lease 已经过期或者不确定, 说明可能出现了一些问题, 比如网络不稳定, 心跳没成功等, 此时使用 ReadIndex 处理
+        // 否则便可以使用 ReadLocal 处理
         match self.inspect_lease() {
             LeaseState::Valid => Ok(RequestPolicy::ReadLocal),
             LeaseState::Expired | LeaseState::Suspect => {

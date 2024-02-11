@@ -187,6 +187,10 @@ impl<E: Engine, L: LockManager, F: KvFormat> Service<E, L, F> {
     }
 }
 
+// 当前 KVService 对事务 API 例如 kv_prewrite, kv_commit 和 Raw API 例如 raw_get, raw_scan 进行了封装
+// 由于他们都会被路由到 Storage 模块, 所以接口无关的逻辑都被封装到了 handle_request 宏中
+// 接口相关的逻辑则被封装到了 future_prewirte, future_commit 等 future_xxx 函数中
+// 需要注意的是, 对于 coprocessor API, raft API 等相关接口依然采用了原生对接 grpc-rs 的方式
 macro_rules! handle_request {
     ($fn_name: ident, $future_name: ident, $req_ty: ident, $resp_ty: ident) => {
         handle_request!($fn_name, $future_name, $req_ty, $resp_ty, no_time_detail);
@@ -1337,6 +1341,7 @@ async fn future_handle_empty(
     Ok(res)
 }
 
+// 对于带有读语义的 future_get, future_scan 等函数, 由于他们会分别调用 Storage 模块的 get/scan 等函数, 因而目前并没有进行进一步抽象
 fn future_get<E: Engine, L: LockManager, F: KvFormat>(
     storage: &Storage<E, L, F>,
     mut req: GetRequest,
@@ -1348,6 +1353,7 @@ fn future_get<E: Engine, L: LockManager, F: KvFormat>(
     )));
     set_tls_tracker_token(tracker);
     let start = Instant::now();
+    // 请求路由到 storage 模块实际进行获取操作
     let v = storage.get(
         req.take_context(),
         Key::from_raw(req.get_key()),
@@ -2015,6 +2021,8 @@ fn future_raw_coprocessor<E: Engine, L: LockManager, F: KvFormat>(
     async move { Ok(ret.await) }
 }
 
+// 在事务相关 API 的 future_xxx 函数实现中, 对于带有写语义的 future_prewrite, future_commit 等函数, 由于它们会被统一调度到 Storage 模块的 sched_txn_command 函数中
+// 当前又抽象出了 txn_command_future 宏来减少冗余代码
 macro_rules! txn_command_future {
     ($fn_name: ident, $req_ty: ident, $resp_ty: ident, ($req: ident) {$($prelude: stmt)*}; ($v: ident, $resp: ident, $tracker: ident) $else_branch: block) => {
         txn_command_future!(inner $fn_name, $req_ty, $resp_ty, ($req) {$($prelude)*}; ($v, $resp, $tracker) {

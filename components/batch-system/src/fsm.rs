@@ -38,6 +38,7 @@ pub trait FsmScheduler {
 
 /// A `Fsm` is a finite state machine. It should be able to be notified for
 /// updating internal state according to incoming messages.
+/// Batch System 是 RaftStore 处理的基石, 是一套用来并发驱动状态机的机制
 pub trait Fsm: Send + 'static {
     type Message: Send + ResourceMetered;
 

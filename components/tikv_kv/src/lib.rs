@@ -687,6 +687,7 @@ pub fn snapshot<E: Engine>(
     ctx: SnapContext<'_>,
 ) -> impl std::future::Future<Output = Result<E::Snap>> {
     let begin = Instant::now();
+    // raftkv::async_snapshot
     let val = engine.async_snapshot(ctx);
     // make engine not cross yield point
     async move {

@@ -934,6 +934,7 @@ where
             let mut inspector = Inspector {
                 delegate: &delegate,
             };
+            // 进行一系列的判断并返回是否可以 ReadLocal
             match inspector.inspect(req) {
                 Ok(RequestPolicy::ReadLocal) => Ok(Some((delegate, RequestPolicy::ReadLocal))),
                 Ok(RequestPolicy::StaleRead) => Ok(Some((delegate, RequestPolicy::StaleRead))),
@@ -1046,6 +1047,8 @@ where
         mut req: RaftCmdRequest,
         cb: Callback<E::Snapshot>,
     ) {
+        // pre_propose_raft_command 判断是否能 readLocal
+        // 在此处能否 ReadLocal 的判断是可以并行的, 也就是乐观情况下并行的读请求可以并行获取底层引擎的 snapshot, 不需要经过 RaftBatchSystem
         match self.pre_propose_raft_command(&req) {
             Ok(Some((mut delegate, policy))) => {
                 let mut snap_updated = false;
@@ -1053,6 +1056,7 @@ where
                 let mut response = match policy {
                     // Leader can read local if and only if it is in lease.
                     RequestPolicy::ReadLocal => {
+                        // 如果可以从本地读取则直接获取本地引擎的 snapshot 并执行 callback 返回即可
                         if let Some(read_resp) = self.try_local_leader_read(
                             &req,
                             &mut delegate,
@@ -1064,6 +1068,7 @@ where
                         } else {
                             fail_point!("localreader_before_redirect", |_| {});
                             // Forward to raftstore.
+                            // 否则便调用 redirect 函数连带 callback 路由到 RaftBatchSystem 的对应 normal 状态机中去执行 ReadIndex 读, 之后本线程不再处理该任务
                             self.redirect(RaftCommand::new(req, cb));
                             return;
                         }

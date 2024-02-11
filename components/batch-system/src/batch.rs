@@ -253,6 +253,21 @@ impl HandleResult {
 ///
 /// A [`PollHandler`] doesn't have to be [`Sync`] because each poll thread has
 /// its own handler.
+/// fsm.rs # Fsm 状态机通过 PollHandler 来驱动
+/// 每个状态机都有其绑定的消息和消息队列
+/// ollHandler 负责驱动状态机，处理自身队列中的消息
+/// 每个 PollHandler 对应一个线程, 其在 poll 函数中会持续地检测需要驱动的状态机并进行处理
+/// 此外还可能将某些 hot region 路由给其他 PollHandler 来做一些负载均衡操作
+/// 每个 region 对应一个 raft 组, 而每个 raft 组在一个 BatchSystem 里就对应一个 normal 状态机:
+/// 对于 RaftBatchSystem:
+/// 参照 raft-rs 接口, 每个 normal 状态机在一轮 loop 中被 PollHandler 获取一次 ready, 其中一般包含需要持久化的未提交日志, 需要发送的消息和需要应用的已提交日志等;
+/// 对于需要持久化的未提交日志, 最直接的做法便是将其暂时缓存到内存中进行攒批, 然后在当前 loop 结尾的 end 函数中统一同步处理, 这无疑会影响每轮 loop 的效率, TiKV 的 6.x 版本已经将 loop 结尾的同步 IO 抽到了 loop 外交给了额外的线程池去做, 这进一步提升了 store loop 的效率;
+/// 对于需要发送的消息, 则通过 Transport 异步发送给对应的 store;
+/// 对于需要应用的已提交日志, 则通过 applyRouter 带着回调函数发给 ApplyBatchSystem
+/// 对于 ApplyBatchSystem:
+/// 每个 normal 状态机在一轮 loop 中被 PollHandler 获取 RaftBatchSystem 发来的若干已经提交需要应用的日志, 其需要将其攒批提交并在之后执行对应的回调函数返回客户端结果
+/// 需要注意的是, 返回客户端结果之后 ApplyBatchSystem 还需要向 RaftBatchSystem 再 propose ApplyRes 的消息, 从而更新 RaftBatchSystem 的某些内存状态
+/// 比如 applyIndex, 该字段的更新能够推动某些阻塞在某个 ReadIndex 上的读请求继续执行
 pub trait PollHandler<N, C>: Send + 'static {
     /// This function is called at the very beginning of every round.
     fn begin<F>(&mut self, _batch_size: usize, update_cfg: F)
@@ -266,9 +281,13 @@ pub trait PollHandler<N, C>: Send + 'static {
     ///
     /// If `None` is returned, this function will be called again with the same
     /// FSM `control` in the next round, unless it is stopped.
+    /// control 状态机
+    /// 对于每一个 Batch System, 只有一个 control 状态机, 负责管理和处理一些需要全局视野的任务
     fn handle_control(&mut self, control: &mut C) -> Option<usize>;
 
     /// This function is called when some normal FSMs are ready.
+    /// normal 状态机
+    /// 其他 normal 状态机负责处理其自身相关的任务
     fn handle_normal(&mut self, normal: &mut impl DerefMut<Target = N>) -> HandleResult;
 
     /// This function is called after [`handle_normal`] is called for all FSMs
@@ -481,6 +500,13 @@ pub trait HandlerBuilder<N, C> {
 /// To use the system, two type of FSMs and their PollHandlers need to be
 /// defined: Normal and Control. Normal FSM handles the general task while
 /// Control FSM creates normal FSM instances.
+/// Batch System 的职责就是检测哪些状态机需要驱动, 然后调用 PollHandler 去消费消息
+/// 消费消息会产生副作用, 而这些副作用或要落盘, 或要网络交互
+/// PollHandler 在一个批次中可以处理多个 normal 状态机
+/// 在 RaftStore 里一共有两个 Batch System
+/// 分别是 RaftBatchSystem 和 ApplyBatchSystem
+/// RaftBatchSystem 用于驱动 Raft 状态机, 包括日志的分发, 落盘, 状态跃迁等
+/// 已经提交的日志会被发往 ApplyBatchSystem 进行处理, ApplyBatchSystem 将日志解析并应用到底层 KV 数据库中, 执行回调函数, 所有的写操作都遵循着这个流程
 pub struct BatchSystem<N: Fsm, C: Fsm> {
     name_prefix: Option<String>,
     router: BatchRouter<N, C>,
