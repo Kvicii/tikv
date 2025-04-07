@@ -592,6 +592,7 @@ where
             };
             res = self
                 .router
+                // 将 task 连带 callback 发送给 RaftBatchSystem 交由 RaftStore 模块处理
                 .send_command(cmd, cb, extra_opts)
                 .map_err(kv::Error::from);
         }

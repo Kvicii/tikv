@@ -679,6 +679,7 @@ where
             }
             distribution[m.discriminant()] += 1;
             match m {
+                // RaftMessage 消息, 其他 Peer 发送过来 Raft 消息, 包括心跳, 日志, 投票消息等
                 PeerMsg::RaftMessage(msg, sent_time) => {
                     if let Some(sent_time) = sent_time {
                         let wait_time = sent_time.saturating_elapsed().as_secs_f64();
@@ -697,6 +698,9 @@ where
                         );
                     }
                 }
+                // 上层提出的 proposal, 其中包含了需要通过 Raft 同步的操作, 以及操作成功之后需要调用的 callback 函数
+                // ReadIndex 请求便是一种特殊的 proposal
+                // 对于 PreWrite 请求, 会进入该分支
                 PeerMsg::RaftCommand(cmd) => {
                     let propose_time = cmd.send_time.saturating_elapsed();
                     self.ctx
@@ -746,6 +750,7 @@ where
                             self.propose_pending_batch_raft_command();
                         }
                     } else {
+                        // 处理 ReadIndex 请求, 处理 PreWrite 请求
                         self.propose_raft_command(
                             cmd.request,
                             cmd.callback,
@@ -755,6 +760,7 @@ where
                 }
                 PeerMsg::Tick(tick) => self.on_tick(tick),
                 PeerMsg::ApplyRes(res) => {
+                // ApplyFsm 在将日志应用到状态机之后发送给 PeerFsm 的消息, 用于在进行操作之后更新某些内存状态
                     self.on_apply_res(res);
                 }
                 PeerMsg::SignificantMsg(msg) => self.on_significant_msg(msg),
@@ -2248,6 +2254,8 @@ where
         }
         self.ctx.pending_count += 1;
         self.ctx.has_ready = true;
+        // 进入 Peer::handle_raft_ready_append 函数
+        // 该函数中会收集 normal 状态机的一次 ready, 接着对需要持久化的未提交日志进行持久化(延后攒批), 需要发送的消息进行异步发送, 需要应用的已提交日志发送给 ApplyBatchSystem
         let res = self.fsm.peer.handle_raft_ready_append(self.ctx);
         if let Some(r) = res {
             self.on_role_changed(r.state_role);
@@ -6009,6 +6017,7 @@ where
         // fails. This is a workaround because `msg` gets moved when proposed.
         let is_admin_request = msg.has_admin_request();
         let admin_cmd_type = is_admin_request.then(|| msg.get_admin_request().get_cmd_type());
+        // 处理 ReadIndex 请求, 处理 PreWrite 请求
         if self.fsm.peer.propose(self.ctx, cb, msg, resp, diskfullopt) {
             self.fsm.has_ready = true;
         } else {

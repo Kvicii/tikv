@@ -1092,6 +1092,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> PollHandler<PeerFsm<EK, ER>, St
             |_| unreachable!()
         );
 
+        // 尝试获取 messages_per_tick 次路由到该状态机的消息
         while self.peer_msg_buf.len() < self.messages_per_tick {
             match peer.receiver.try_recv() {
                 // TODO: we may need a way to optimize the message copy.
@@ -1117,9 +1118,11 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> PollHandler<PeerFsm<EK, ER>, St
         }
 
         let mut delegate = PeerFsmDelegate::new(peer, &mut self.poll_ctx);
+        // 调用 PeerFsmDelegate::handle_msgs 函数进行处理
         delegate.handle_msgs(&mut self.peer_msg_buf);
         // No readiness is generated and using sync write, skipping calling ready and
         // release early.
+        // 调用 PeerFsmDelegate::collect_ready() 函数
         if !delegate.collect_ready() && self.poll_ctx.sync_write_worker.is_some() {
             if let HandleResult::StopAt { skip_end, .. } = &mut handle_result {
                 *skip_end = true;

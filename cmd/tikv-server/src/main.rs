@@ -20,6 +20,7 @@ fn main() {
     let build_timestamp = option_env!("TIKV_BUILD_TIME");
     let version_info = tikv::tikv_version_info(build_timestamp);
 
+    // 解析配置参数
     let matches = App::new("TiKV")
         .about("A distributed transactional key-value database powered by Rust and Raft")
         .author(crate_authors!())
@@ -245,6 +246,7 @@ fn main() {
     config.memory.init();
 
     let (service_event_tx, service_event_rx) = tikv_util::mpsc::unbounded(); // pipe for controling service
+    // 启动 tikv 进程
     match config.storage.engine {
         EngineType::RaftKv => server::server::run_tikv(config, service_event_tx, service_event_rx),
         EngineType::RaftKv2 => {

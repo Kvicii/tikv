@@ -238,12 +238,17 @@ impl From<StorageCallback> for SchedulerTaskCallback {
 
 struct TxnSchedulerInner<L: LockManager> {
     // slot_id -> { cid -> `TaskContext` } in the slot.
+    // 用于存储 Scheduler 中所有请求的上下文, 比如暂时未能获取到所有所需 latch 的请求会被暂存在 task_slots 中
+    // 实际上 task_slots 和 id_alloc 与 TiKV 的异步执行框架有关系
     task_slots: Vec<CachePadded<Mutex<HashMap<u64, TaskContext>>>>,
 
     // cmd id generator
+    // 到达 Scheduler 的请求都会被分配一个唯一的 command id
     id_alloc: CachePadded<AtomicU64>,
 
     // write concurrency control
+    // 写请求到达 Scheduler 之后会尝试获取所需要的 latch, 如果暂时获取不到所需要的 latch, 其对应的 command id 会被插入到 latch 的 waiting list 里
+    // 当前面的请求执行结束后会唤醒 waiting list 里的请求继续执行
     latches: Latches,
 
     sched_pending_write_threshold: usize,
@@ -261,15 +266,19 @@ struct TxnSchedulerInner<L: LockManager> {
 
     control_mutex: Arc<tokio::sync::Mutex<bool>>,
 
+    // 悲观事务冲突管理器, 当多个并行悲观事务之间存在冲突时可能会暂时阻塞某些事务
     lock_mgr: L,
 
     concurrency_manager: ConcurrencyManager,
+
+    // ============================TiKV 悲观事务若干优化引入的新字段START============================
 
     pipelined_pessimistic_lock: Arc<AtomicBool>,
 
     in_memory_pessimistic_lock: Arc<AtomicBool>,
 
     enable_async_apply_prewrite: bool,
+    // ============================TiKV 悲观事务若干优化引入的新字段END============================
 
     pessimistic_lock_wake_up_delay_duration_ms: Arc<AtomicU64>,
 
@@ -582,7 +591,10 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
             .get(priority_tag)
             .inc();
 
+        // 依据该 cid 将本次请求的 command 包在一个 task 中
         let mut task_slot = self.inner.get_task_slot(cid);
+        // 将该 task 附带 callback 生成一个 TaskContext 插入到 task_slot 中
+        // 当前 command 连同 callback 等上下文会被保存到 task_slots 中
         let tctx = task_slot.entry(cid).or_insert_with(|| {
             self.inner
                 .new_task_context(task, callback, prepared_latches)
@@ -593,11 +605,17 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
             tracker.req_info.request_type = cmd_type;
             tracker.req_info.cid = cid;
         });
+
+        // 尝试去申请 latches
+        // 当前任务便会被阻塞在某些 latch 上等待其他线程去唤醒进而执行, 当前线程会直接返回并执行其他的工作
         if self.inner.latches.acquire(&mut tctx.lock, cid) {
             fail_point!("txn_scheduler_acquire_success");
             tctx.on_schedule();
             let task = tctx.task.take().unwrap();
             drop(task_slot);
+            // 如果成功便会继续调用 execute 函数去真正执行 task
+            // 由于每个获取到所有 latch 去执行的任务会在执行结束后调用 scheduler::release_lock 函数来释放所拥有的全部 latch
+            // 在释放过程中, 便能够获取到阻塞在这些 latch 且位于 waiting 队列首位的所有其他 task, 接着对应线程会调用 scheduler::try_to_wake_up 函数遍历唤醒这些 task 并尝试再次获取 latch 和执行, 一旦能够获取成功便去 execute, 否则继续阻塞等待其他线程再次唤醒即可
             self.execute(task);
             return;
         }
@@ -1247,6 +1265,7 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
             if task.cmd().readonly() {
                 self.process_read(snapshot, task, &mut sched_details);
             } else {
+                // 处理写请求会被路由到 scheduler::process_write 函数中
                 self.process_write(snapshot, task, &mut sched_details).await;
             };
             tls_collect_scan_details(tag.get_str(), &sched_details.stat);
@@ -1322,7 +1341,11 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
             };
             let begin_instant = Instant::now();
             let res = unsafe {
-                with_perf_context::<E, _, _>(tag, || task.process_write(snapshot, context))
+                with_perf_context::<E, _, _>(tag, || task
+                    // 根据 snapshot 和 task 执行事务对应的语义
+                    // 可以从 Command::process_write 函数看到不同的请求都有不同的实现, 每种请求都可能根据 snapshot 去底层获取一些数据并尝试写入一些数据
+                    // 此时的写入仅仅缓存在了 WriteData 中, 并没有对底层引擎进行实际修改
+                    .process_write(snapshot, context))
             };
             let cmd_process_duration = begin_instant.saturating_elapsed();
             sched_details.cmd_process_nanos = cmd_process_duration.as_nanos() as u64;
@@ -1692,6 +1715,7 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
         let async_write_start = Instant::now_coarse();
         let mut res = unsafe {
             with_tls_engine(|e: &mut E| {
+                // 将缓存的 WriteData 实际写入到 engine 层, 对于 RaftKV 来说则是表示一次 propose, 想要对这一批 WriteData commit 且 apply
                 e.async_write(&ctx, to_be_write, subscribed, Some(on_applied))
             })
         };

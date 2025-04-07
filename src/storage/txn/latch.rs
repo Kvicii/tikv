@@ -181,6 +181,7 @@ impl Latches {
     /// true if all the Latches are acquired, false otherwise.
     pub fn acquire(&self, lock: &mut Lock, who: u64) -> bool {
         let mut acquired_count: usize = 0;
+        // 渐进的去收集所有 latch
         for &key_hash in &lock.required_hashes[lock.owned_count..] {
             let mut latch = self.lock_latch(key_hash);
             match latch.get_first_req_by_hash(key_hash) {
@@ -193,6 +194,8 @@ impl Latches {
                     }
                 }
                 None => {
+                    // 如果在本次函数调用中没有收集到所有的 latch, 当前线程不会受到任何阻塞而是直接返回 false
+                    // 在返回 false 之前其也会利用 latch.wair_for_wake 函数将当前 task 的 id 放到对应 latch 的 waiting 队列里面, 之后当前线程便可以处理其他的任务而不是阻塞在该任务上
                     latch.wait_for_wake(key_hash, who);
                     acquired_count += 1;
                 }
