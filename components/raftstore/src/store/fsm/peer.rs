@@ -759,8 +759,8 @@ where
                     }
                 }
                 PeerMsg::Tick(tick) => self.on_tick(tick),
-                PeerMsg::ApplyRes(res) => {
                 // ApplyFsm 在将日志应用到状态机之后发送给 PeerFsm 的消息, 用于在进行操作之后更新某些内存状态
+                PeerMsg::ApplyRes(res) => {
                     self.on_apply_res(res);
                 }
                 PeerMsg::SignificantMsg(msg) => self.on_significant_msg(msg),

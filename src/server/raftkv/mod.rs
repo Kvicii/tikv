@@ -766,6 +766,7 @@ where
 
     let read_ctx = ReadContext::new(ctx.read_id, ctx.start_ts.map(|ts| ts.into_inner()));
     if res.is_ok() {
+        // 调用 ServerRaftStoreRouter::read 实际读取
         res = router
             .read(read_ctx, cmd, store_cb)
             .map_err(kv::Error::from);
